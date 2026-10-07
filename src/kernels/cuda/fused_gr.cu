@@ -1064,6 +1064,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
         for (int c = 0; c < HC; ++c) s += g[k][c][col];
         m.a[k].mixed[d0 + col] = s / (float) HC;
     }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
 }
 #endif
 
@@ -1740,7 +1741,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
             std::exit(1);
         }
-        return false;   // the gfx906 STRATA_GR_SPLIT read: no q8_1 (the caller quantizes), like the v3 path above
+        return q8;
     }
 #endif
     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted

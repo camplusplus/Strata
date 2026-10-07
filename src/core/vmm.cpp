@@ -25,15 +25,9 @@ struct Api {
 template <class F> bool resolve(const char* name, F& f) {
     cudaDriverEntryPointQueryResult q{};
     void* p = nullptr;
-#if CUDART_VERSION >= 12050
-    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
-#else   // the versioned query arrived in CUDA 12.5
-    const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
-#endif
-    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || p == nullptr) {
-        (void) cudaGetLastError();
+    if (cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+        q != cudaDriverEntryPointSuccess || p == nullptr)
         return false;
-    }
     f = (F) p;
     return true;
 }
@@ -151,7 +145,7 @@ VmmChunk VmmRange::unmap(int64_t i) {
 
 }  // namespace strata::core
 
-#else  // HIP: no virtual memory here; the elastic K/V stays off
+#else  // HIP (and the gfx906 build): no virtual memory here; the elastic K/V stays off
 
 namespace strata::core {
 bool vmm_available() { return false; }

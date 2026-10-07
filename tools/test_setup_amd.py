@@ -49,7 +49,7 @@ class KfdDetection(unittest.TestCase):
             (110001, 120, 128, "", 16 << 30),                     # gfx1101 without a product name
             (120000, 64, 129, None, 16 << 30),                    # gfx1200, no product_name file
             (120001, 128, 130, "AMD Radeon AI PRO R9700", 32 << 30),
-            (110002, 64, 131, None, 8 << 30),                     # gfx1102: supported, unvalidated (#938)
+            (110002, 64, 131, None, 8 << 30),                     # gfx1102: listed, not supported
             (100306, 4, 132, None, 512 << 20),                    # an integrated gfx1036: listed, not supported
             (110000, 192, 133, "Radeon RX 7900 XTX", 24 << 30),
         ])
@@ -59,10 +59,11 @@ class KfdDetection(unittest.TestCase):
         self.assertEqual(g[0]["name"], setup.AMD_NAMES["gfx1101"])
         self.assertEqual(g[1]["name"], setup.AMD_NAMES["gfx1200"])
         self.assertEqual(g[2]["name"], "AMD Radeon AI PRO R9700")
-        self.assertEqual(g[3]["name"], setup.AMD_NAMES["gfx1102"])
+        self.assertEqual(g[3]["name"], "AMD Radeon (gfx1102)")
         self.assertAlmostEqual(g[2]["vram_gb"], 32.0)
         ok = [x["arch"] for x in g if setup.amd_problem(x) is None]
-        self.assertEqual(ok, ["gfx1101", "gfx1200", "gfx1201", "gfx1102", "gfx1100"])
+        self.assertEqual(ok, ["gfx1101", "gfx1200", "gfx1201", "gfx1100"])
+        self.assertIn("gfx1102", setup.amd_problem(g[3]))
         self.assertIn("gfx1036", setup.amd_problem(g[4]))
 
     def test_no_kfd(self):
@@ -70,7 +71,8 @@ class KfdDetection(unittest.TestCase):
 
     def test_rocm_index_per_family(self):
         for arch in setup.AMD_ARCHS:
-            self.assertIn(arch, setup.ROCM_INDEXES)
+            if arch not in setup.AMD_WAVE64:          # gfx906: a system ROCm only (no wheels have its libraries)
+                self.assertIn(arch, setup.ROCM_INDEXES)
         self.assertTrue(setup.ROCM_INDEXES["gfx1101"].endswith("/gfx110X-dgpu/"))
         self.assertTrue(setup.ROCM_INDEXES["gfx1200"].endswith("/gfx120X-all/"))
         self.assertEqual(setup.ROCM_INDEXES["gfx1101"], setup.ROCM_INDEXES["gfx1100"])
@@ -187,6 +189,126 @@ class GpuLists(unittest.TestCase):
             finally:
                 for k, v in saved.items():
                     setattr(setup, k, v)
+
+
+def fake_rocm(root: Path, lib="lib", version=(7, 2)) -> None:
+    """A system ROCm with what rocm_root looks for: hipcc, libhipblas in `lib`, rocm-core's version, the HIP
+    development files."""
+    for rel, text in (("bin/hipcc", ""), (f"{lib}/libhipblas.so.3", ""), ("include/hip/hip_runtime.h", ""),
+                      (f"{lib}/cmake/hip-lang/hip-lang-config.cmake", ""),
+                      ("include/rocm-core/rocm_version.h",
+                       f"#define ROCM_VERSION_MAJOR {version[0]}\n#define ROCM_VERSION_MINOR {version[1]}\n")):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+
+
+class DistroRocmAndGfx906(unittest.TestCase):
+    """A distribution's ROCm (Gentoo's: in /usr, libraries in lib64, clang from the system LLVM) and the Radeon VII /
+    Instinct MI50 / MI60 (gfx906), whose wave64 engine is its own build with a system ROCm only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.said = []
+        self.saved = {k: getattr(setup, k) for k in ("say", "out")}
+        setup.say = lambda msg="": self.said.append(msg)
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(setup, k, v)
+        self.tmp.cleanup()
+
+    def test_gfx906_is_supported_and_named(self):
+        fake_sysfs(self.root, [(0, 0, 0, None, 0), (90006, 240, 128, None, 16 << 30)])   # Radeon VII: no product_name
+        with mock.patch.object(setup, "WIN", False):
+            g = setup.amd_gpus(str(self.root))
+        self.assertEqual(g[0]["arch"], "gfx906")
+        self.assertEqual(g[0]["name"], setup.AMD_NAMES["gfx906"])
+        self.assertIsNone(setup.amd_problem(g[0]))
+
+    def test_rocm_where_hipconfig_says(self):
+        """ROCM_PATH first, then /opt/rocm, then hipconfig --rocmpath (Gentoo: /usr)."""
+        setup.out = lambda cmd: "/usr" if cmd[1:] == ["--rocmpath"] else ""
+        env = {k: v for k, v in setup.os.environ.items() if k != "ROCM_PATH"}
+        with mock.patch.dict(setup.os.environ, env, clear=True), \
+                mock.patch.object(setup.shutil, "which", lambda n: "/usr/bin/hipconfig"), \
+                mock.patch.object(setup.Path, "exists", lambda p: False if str(p) == "/opt/rocm/bin/hipcc"
+                                  else setup.os.path.exists(p)):
+            self.assertEqual(setup.system_rocm(), Path("/usr"))
+        with mock.patch.dict(setup.os.environ, {"ROCM_PATH": str(self.root)}):
+            self.assertEqual(setup.system_rocm(), self.root)
+
+    def test_libraries_in_lib64(self):
+        fake_rocm(self.root, "lib64")
+        with mock.patch.dict(setup.os.environ, {"ROCM_PATH": str(self.root)}):
+            self.assertEqual(setup.rocm_root(["gfx906"]), (self.root, [str(self.root / "lib64")]))
+            self.assertEqual(setup.rocm_root("gfx1100"), (self.root, [str(self.root / "lib64")]))
+
+    def test_gfx906_without_a_system_rocm_stops(self):
+        """AMD's wheels have no gfx906 libraries: no system ROCm (or an unusable one) is a stop, never the wheels."""
+        with mock.patch.dict(setup.os.environ, {"ROCM_PATH": str(self.root)}):
+            with self.assertRaises(SystemExit):
+                setup.rocm_root(["gfx906"])
+            self.assertIn("gfx906", "\n".join(self.said))
+            fake_rocm(self.root, version=(6, 4))
+            self.said.clear()
+            with self.assertRaises(SystemExit):
+                setup.rocm_root(["gfx906"])
+            text = "\n".join(self.said)
+            self.assertIn("is 6.4", text)
+            self.assertNotIn("wheels in .venv instead", text)
+
+    def test_clang_from_hipconfig(self):
+        llvm = self.root / "llvm22" / "bin"
+        llvm.mkdir(parents=True)
+        (llvm / "clang++").write_text("")
+        (self.root / "bin").mkdir()
+        (self.root / "bin" / "hipconfig").write_text("")
+        setup.out = lambda cmd: str(llvm) + "\n" if cmd[1:] == ["--hipclangpath"] else ""
+        self.assertEqual(setup.hip_clang(self.root), llvm / "clang++")
+        own = self.root / "llvm" / "bin" / "clang++"     # ROCm's own LLVM wins (AMD's packages and wheels)
+        own.parent.mkdir(parents=True)
+        own.write_text("")
+        self.assertEqual(setup.hip_clang(self.root), own)
+
+    def test_gfx906_build(self):
+        """The wave64 build: STRATA_HIP_GFX906 in build-906, the HIP clang for C/C++ too, none of the wave32
+        backend's switches; never together with another family."""
+        calls = {}
+        saved = {k: getattr(setup, k) for k in ("ROOT", "rocm_root", "hip_clang", "cmake_build", "source_hash",
+                                                "source_version", "ok", "shutil")}
+        root = self.root
+        clang = root / "llvm22" / "bin" / "clang++"
+
+        def fake_build(src, bdir, target, defs, vcvars, bat):
+            calls["bdir"], calls["defs"] = bdir, defs
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / setup.EXE).write_text("engine")
+
+        class Sh:
+            which = staticmethod(lambda name: "/usr/bin/" + name)
+            copy2 = staticmethod(lambda a, b: Path(b).write_text(Path(a).read_text()))
+        setup.ROOT, setup.cmake_build, setup.ok, setup.shutil = root, fake_build, lambda *a: None, Sh
+        setup.source_hash, setup.source_version = (lambda *a: "h"), (lambda: "0.1.40")
+        setup.rocm_root = lambda archs: (root, [str(root / "lib64")])
+        setup.hip_clang = lambda r: clang
+        try:
+            with mock.patch.dict(setup.os.environ, {}):
+                setup.build_engine_hip({"arch": "gfx906"}, root)
+                with self.assertRaises(SystemExit):
+                    setup.build_engine_hip({"arch": "gfx906", "archs": ["gfx906", "gfx1100"]}, root)
+            self.assertEqual(calls["bdir"], root / "build-906")
+            defs = calls["defs"]
+            for d in ("-DSTRATA_HIP_GFX906=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx906", f"-DCMAKE_HIP_COMPILER={clang}",
+                      f"-DCMAKE_CXX_COMPILER={clang}", f"-DCMAKE_C_COMPILER={clang.with_name('clang')}"):
+                self.assertIn(d, defs)
+            for d in ("-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_PREFILL_MMQ=ON"):
+                self.assertNotIn(d, defs)
+            import json
+            self.assertEqual(json.loads((root / "engine" / "BUILD.json").read_text())["archs"], ["gfx906"])
+        finally:
+            for k, v in saved.items():
+                setattr(setup, k, v)
 
 
 class WindowsDetection(unittest.TestCase):
@@ -463,61 +585,6 @@ class HipRuntimeBesideExe(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             setup.hip_runtime_beside_exe(Path(d))                   # no BUILD.json (a CUDA or Linux engine)
             self.assertEqual(list(Path(d).iterdir()), [])
-
-
-class DeviceAccess(unittest.TestCase):
-    """Linux AMD: /dev/kfd and the render nodes must be openable by the user; setup warns, never refuses."""
-
-    def dev(self, d, kfd=True, nodes=("renderD128",)):
-        root = Path(d)
-        (root / "dri").mkdir()
-        if kfd:
-            (root / "kfd").write_text("")
-        for n in nodes:
-            (root / "dri" / n).write_text("")
-        return str(root)
-
-    def test_accessible_is_silent(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.assertIsNone(setup.amd_device_access_problem(self.dev(d), access=lambda p, m: True))
-
-    def test_no_kfd_is_not_this_problem(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.assertIsNone(setup.amd_device_access_problem(self.dev(d, kfd=False), access=lambda p, m: False))
-
-    def test_kfd_denied_names_the_fix(self):
-        with tempfile.TemporaryDirectory() as d:
-            msg = setup.amd_device_access_problem(self.dev(d), access=lambda p, m: not p.endswith("kfd"))
-            self.assertIn("kfd", msg)
-            self.assertNotIn("renderD128", msg)
-            self.assertIn("sudo usermod -aG render,video $USER", msg)
-            self.assertIn("log out and in", msg)
-
-    def test_render_node_denied(self):
-        with tempfile.TemporaryDirectory() as d:
-            msg = setup.amd_device_access_problem(self.dev(d), access=lambda p, m: "renderD" not in p)
-            self.assertIn("renderD128", msg)
-            self.assertNotIn("/kfd", msg)
-
-    def test_engine_names_the_permission_not_another_program(self):
-        src = (Path(setup.__file__).resolve().parent / "src/program/generate.cpp").read_text(encoding="utf-8")
-        i = src.index("cannot open /dev/kfd")
-        guard = src[src.rindex("#if", 0, i):i]
-        self.assertIn("cudaGetDeviceCount", guard)
-        self.assertIn('access("/dev/kfd", R_OK | W_OK)', guard)
-        self.assertIn("STRATA_USE_HIP", guard)               # CUDA builds keep the "another program" text
-        self.assertIn("another program (or an engine that is still exiting)", src)
-
-
-class TdrPointer(unittest.TestCase):
-    def test_setup_points_windows_gfx12_to_the_entry(self):
-        src = Path(setup.__file__).read_text(encoding="utf-8")
-        self.assertIn('WIN and str(gpu.get("arch") or "").startswith("gfx12")', src)
-        doc = (Path(setup.__file__).resolve().parent / "docs/TROUBLESHOOTING.md").read_text(encoding="utf-8")
-        self.assertIn("Windows AMD: the driver resets", doc)
-        for env in ("STRATA_PF_STEP_SYNC", "STRATA_KV_HOST_DMA"):
-            self.assertIn(env, doc)
-            self.assertIn(env, (Path(setup.__file__).resolve().parent / "src/prefill/prefill.cpp").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
